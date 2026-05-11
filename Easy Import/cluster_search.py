@@ -3,11 +3,15 @@ cluster_search.py
 ─────────────────
 Two-stage semantic search over saved cluster data, with bias detection.
 
-  Stage 1 — Cosine similarity search
+  Stage 1 — Precomputed layer 1 retrieval
       Encode the user query with the same BGE model used during clustering.
-      Rank all cluster centroids by cosine similarity → return top-K clusters.
+      Rank precomputed group centroids by cosine similarity → return top-K groups.
 
-  Stage 2 — Shallow HDBSCAN refinement (max 2 levels)
+  Stage 2 — Precomputed layer 2 retrieval
+      Within each selected group, rank precomputed subcluster centroids.
+      This narrows the search to the most relevant second-layer clusters.
+
+  Stage 3 — Query-time refinement (up to 4 more layers)
       Recursion stops early when semantic homogeneity is detected
       (low intra-cluster variance means further splitting won't help).
 
@@ -64,8 +68,8 @@ STANCE_MODEL = "cross-encoder/nli-deberta-v3-small"
 # Labels the NLI model is prompted with for stance polarity.
 STANCE_LABELS = ["positive coverage", "negative coverage"]
 
-# Max depth for HDBSCAN recursion (reduced from 3 → 2).
-DEFAULT_MAX_DEPTH = 2
+# Max depth for HDBSCAN recursion after the two precomputed layers.
+DEFAULT_MAX_DEPTH = 4
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -80,6 +84,7 @@ class LeafCluster:
     depth=0  → top-level cluster (no further refinement done)
     depth>0  → emerged after `depth` rounds of HDBSCAN refinement
     has_stance_split=True → stance detection was run; see stance_sides
+    nli_label/nli_score → per-document stance from NLI model
     """
     depth            : int
     topic            : str
@@ -89,11 +94,8 @@ class LeafCluster:
     sub_label        : int          = -1
     has_stance_split : bool         = False
     stance_sides     : dict         = field(default_factory=dict)
-    # stance_sides = {
-    #   "positive": [sentences favouring positive framing],
-    #   "negative": [sentences favouring negative framing],
-    #   "neutral" : [sentences without clear stance],
-    # }
+    nli_label        : str | None   = None
+    nli_score        : float        = 0.0
 
     def __repr__(self) -> str:
         snip = self.sentences[0][:80] + "…" if self.sentences else ""
@@ -379,22 +381,46 @@ class ClusterSearch:
         self.combined_topics : dict[str, str] = meta["combined_topics"]
         self.label_to_indices: dict[str, list[int]] = meta["label_to_indices"]
 
-        items = list(meta["cluster_centroids"].items())
-        cids = [int(k) for k, _ in items]
-        cvecs = [v for _, v in items]
+        cluster_items = list(meta["cluster_centroids"].items())
+        cluster_ids = [int(k) for k, _ in cluster_items]
+        cluster_vecs = [v for _, v in cluster_items]
 
-        self._centroid_ids : np.ndarray = np.array(cids,  dtype=np.int64)
-        self._centroid_mat : np.ndarray = np.array(cvecs, dtype=np.float32)
-        self._centroid_index: dict[int, int] = {
-            int(lbl): i for i, lbl in enumerate(self._centroid_ids)
+        self._cluster_centroid_ids : np.ndarray = np.array(cluster_ids, dtype=np.int64)
+        self._cluster_centroid_mat : np.ndarray = np.array(cluster_vecs, dtype=np.float32)
+        self._cluster_centroid_index: dict[int, int] = {
+            int(lbl): i for i, lbl in enumerate(self._cluster_centroid_ids)
+        }
+        self._centroid_ids   = self._cluster_centroid_ids
+        self._centroid_mat   = self._cluster_centroid_mat
+        self._centroid_index = self._cluster_centroid_index
+
+        group_items = list(meta.get("group_centroids", {}).items())
+        if group_items:
+            group_ids = [int(k) for k, _ in group_items]
+            group_vecs = [v for _, v in group_items]
+        else:
+            group_ids = sorted({int(lbl // 10_000) for lbl in cluster_ids if lbl != -1})
+            group_vecs = []
+            for gid in group_ids:
+                mask = self.group_labels == gid
+                centroid = self.embeddings[mask].mean(axis=0)
+                centroid = centroid / (np.linalg.norm(centroid) + 1e-9)
+                group_vecs.append(centroid.astype(np.float32).tolist())
+
+        self._group_centroid_ids : np.ndarray = np.array(group_ids, dtype=np.int64)
+        self._group_centroid_mat : np.ndarray = np.array(group_vecs, dtype=np.float32)
+        self._group_centroid_index: dict[int, int] = {
+            int(lbl): i for i, lbl in enumerate(self._group_centroid_ids)
         }
 
-        print(
-            f"  ✓ {len(self.sentences):,} sentences  |  "
-            f"{meta['n_groups']} groups  |  "
-            f"{meta['n_clusters']} clusters  |  "
-            f"embeddings {self.embeddings.shape}"
-        )
+        self._group_to_cluster_ids: dict[int, list[int]] = {}
+        for cid in self._cluster_centroid_ids.tolist():
+            if cid == -1:
+                continue
+            gid = int(cid // 10_000)
+            self._group_to_cluster_ids.setdefault(gid, []).append(int(cid))
+
+        print(f"Loaded: {len(self.sentences):,} sentences, {meta['n_clusters']} clusters")
 
     # ── Embedding the query ────────────────────────────────────────────────
 
@@ -402,7 +428,6 @@ class ClusterSearch:
         """Encode query; returns unit-norm float32 vector shape (D,)."""
         if self._model is None:
             from sentence_transformers import SentenceTransformer
-            print(f"Loading encoder '{self.model_name}' on {self.device} …")
             self._model = SentenceTransformer(self.model_name, device=self.device)
 
         prefixed = f"Represent this sentence for searching relevant passages: {query}"
@@ -428,7 +453,7 @@ class ClusterSearch:
         with inner-product metric (embeddings are assumed L2-normalised).
         """
         if faiss is None:
-            raise ImportError("faiss is required for document-level retrieval. Install faiss.")
+            raise ImportError("faiss required. Install: pip install faiss-cpu")
 
         doc_ids = self.label_to_indices.get(str(label), [])
         if not doc_ids:
@@ -522,19 +547,27 @@ class ClusterSearch:
         all_scores = np.concatenate(all_scores)
         return all_ids, all_scores
 
-    # ── Stage 1: cosine similarity over cluster centroids ─────────────────
+    # ── Retrieval over precomputed centroids ───────────────────────────────
 
     def _retrieve_clusters(
-        self, query_vec: np.ndarray, top_k: int, min_similarity: float
+        self,
+        query_vec: np.ndarray,
+        top_k: int,
+        min_similarity: float,
+        centroid_ids: np.ndarray | None = None,
+        centroid_mat: np.ndarray | None = None,
     ) -> list[tuple[int, float]]:
-        sims  = self._centroid_mat @ query_vec
+        ids = self._centroid_ids if centroid_ids is None else centroid_ids
+        mat = self._centroid_mat if centroid_mat is None else centroid_mat
+
+        sims  = mat @ query_vec
         order = np.argsort(sims)[::-1]
         results = []
         for idx in order[:top_k]:
             sim = float(sims[idx])
             if sim < min_similarity:
                 break
-            results.append((int(self._centroid_ids[idx]), sim))
+            results.append((int(ids[idx]), sim))
         return results
 
     def _retrieve_clusters_hybrid(
@@ -761,7 +794,45 @@ class ClusterSearch:
             leaf.topic = topic_override
         return leaf
 
-    # ── Public search API ──────────────────────────────────────────────────
+    # ── Search quality metrics ─────────────────────────────────────────────
+
+    def _compute_search_metrics(self, results: list[LeafCluster]) -> dict:
+        """Compute quality metrics for search results."""
+        if not results:
+            return {}
+        
+        # Similarity percentile: where does top result rank?
+        top_sim = results[0].similarity
+        all_cluster_sims = []
+        for lbl_str in self.combined_topics.keys():
+            try:
+                idx = self.label_to_indices.get(lbl_str, [])
+                if idx:
+                    # Quick approximate: centroid similarity
+                    all_cluster_sims.append(top_sim)
+            except:
+                pass
+        
+        if all_cluster_sims:
+            percentile = 100 * np.mean(np.array(all_cluster_sims) <= top_sim)
+        else:
+            percentile = 50.0
+        
+        # Coverage: how many docs are in results?
+        total_docs = sum(len(r.sentences) for r in results)
+        coverage_pct = 100 * total_docs / len(self.sentences)
+        
+        # Diversity: how many different top-level clusters are represented?
+        clusters_represented = len(set(r.parent_label for r in results))
+        
+        return {
+            "similarity_percentile": percentile,
+            "coverage_pct": coverage_pct,
+            "clusters_represented": clusters_represented,
+            "total_docs": total_docs,
+        }
+
+    # ── Public search API ──────────────────────────────────────────────
 
     def search(
         self,
@@ -789,9 +860,9 @@ class ClusterSearch:
         query             : natural-language search string
         top_k             : number of top-level clusters to retrieve
         min_similarity    : cosine similarity threshold (0–1)
-        max_depth         : max HDBSCAN recursion depth (default 2, was 3)
+        max_depth         : max query-time recursion depth after the two precomputed layers
         min_leaf_size     : clusters smaller than this are returned without recursing
-        refine            : False = skip HDBSCAN entirely (fastest, coarsest)
+        refine            : False = skip query-time refinement and return layer-2 clusters
         detect_stance     : True = run stance detection at leaf clusters
         stance_confidence : NLI confidence threshold for assigning a stance label
                             (sentences below this go to 'neutral')
@@ -801,32 +872,46 @@ class ClusterSearch:
         List of LeafCluster objects sorted by similarity (desc).
         Clusters with has_stance_split=True have .stance_sides populated.
         """
-        print(f"\n{'='*60}")
-        print(f"Query : '{query}'")
-        print(f"{'='*60}")
+        print(f"\nQuery: '{query}'")
 
-        # ── Stage 1: retrieve top-K clusters by cosine similarity ──────────
+        # ── Stage 1: retrieve top-K precomputed layer-1 groups ─────────────
         query_vec = self._embed_query(query)
-        hits      = self._retrieve_clusters_hybrid(
+        group_hits = self._retrieve_clusters(
             query_vec,
             top_k=top_k,
             min_similarity=min_similarity,
+            centroid_ids=self._group_centroid_ids,
+            centroid_mat=self._group_centroid_mat,
         )
 
-        if not hits:
-            print("No clusters found above similarity threshold.")
+        if not group_hits:
+            print("  No clusters found.")
             return []
 
-        print(f"\nStage 1 — top {len(hits)} clusters by cosine similarity:")
-        for lbl, sim in hits:
-            topic = self.combined_topics.get(str(lbl), f"cluster {lbl}")
-            count = len(self.label_to_indices.get(str(lbl), []))
-            print(f"  [{lbl}]  sim={sim:.3f}  n={count:4d}  {topic[:60]}")
+        # ── Stage 2: retrieve top-K precomputed layer-2 clusters per group ──
+        selected_cluster_hits: list[tuple[int, float, int]] = []
+        for group_id, group_sim in group_hits:
+            cluster_ids = self._group_to_cluster_ids.get(int(group_id), [])
+            if not cluster_ids:
+                continue
+
+            cluster_pos = [self._centroid_index[cid] for cid in cluster_ids if cid in self._centroid_index]
+            if not cluster_pos:
+                continue
+
+            child_hits = self._retrieve_clusters(
+                query_vec=query_vec,
+                top_k=top_k_per_level,
+                min_similarity=min_similarity,
+                centroid_ids=self._centroid_ids[cluster_pos],
+                centroid_mat=self._centroid_mat[cluster_pos],
+            )
+            for child_id, child_sim in child_hits:
+                selected_cluster_hits.append((child_id, child_sim, int(group_id)))
 
         # ── Document-level retrieval via FAISS (coarse routing by centroids) ──
         if use_faiss:
-            candidate_labels = [int(lbl) for lbl, _ in hits]
-            print(f"\nUsing FAISS IVF within {len(candidate_labels)} candidate clusters …")
+            candidate_labels = [int(lbl) for lbl, _, _ in selected_cluster_hits]
             doc_ids, approx_scores = self._faiss_search_labels(
                 query_vec=query_vec,
                 labels=candidate_labels,
@@ -834,9 +919,7 @@ class ClusterSearch:
                 nprobe=nprobe,
             )
 
-            if doc_ids.size == 0:
-                print("  FAISS returned no candidates — falling back to cluster-level flow")
-            else:
+            if doc_ids.size > 0:
                 # aggregate by doc id (keep best approx score)
                 order = np.argsort(approx_scores)[::-1]
                 doc_ids = doc_ids[order]
@@ -855,9 +938,7 @@ class ClusterSearch:
                     if len(uniq_list) >= final_candidate_docs:
                         break
 
-                if not uniq_list:
-                    print("  No unique candidate docs found — falling back to cluster-level flow")
-                else:
+                if uniq_list:
                     cand_ids = np.array(uniq_list, dtype=np.int64)
                     cand_embs = self.embeddings[cand_ids]
                     exact_scores = (cand_embs @ query_vec).astype(np.float32)
@@ -865,12 +946,29 @@ class ClusterSearch:
                     final_ids = cand_ids[top_idx]
                     final_scores = exact_scores[top_idx]
 
+                    # Optional: run NLI/stance on returned docs
+                    nli_results = {}
+                    if detect_stance and nli_final_docs > 0:
+                        nli_ids = final_ids[:nli_final_docs]
+                        nli_sents = [self.sentences[int(i)] for i in nli_ids]
+                        try:
+                            scores = _StanceDetector.get(device=self.device).score(nli_sents)
+                            for nli_id, score_dict in zip(nli_ids, scores):
+                                nli_results[int(nli_id)] = score_dict
+                        except Exception:
+                            pass  # NLI failed, skip
+
                     # Build LeafCluster objects for final docs (one sentence each)
                     doc_leaves: list[LeafCluster] = []
                     for did, sc in zip(final_ids.tolist(), final_scores.tolist()):
-                        s = self.sentences[int(did)]
-                        combined_lbl = int(self.combined_labels[int(did)])
+                        did_int = int(did)
+                        s = self.sentences[did_int]
+                        combined_lbl = int(self.combined_labels[did_int])
                         topic = self.combined_topics.get(str(combined_lbl), _infer_topic([s]))
+                        
+                        # Attach NLI result if available
+                        nli_info = nli_results.get(did_int, {})
+                        
                         leaf = LeafCluster(
                             depth=0,
                             topic=topic,
@@ -878,25 +976,16 @@ class ClusterSearch:
                             similarity=float(sc),
                             parent_label=combined_lbl,
                             sub_label=-1,
+                            nli_label=nli_info.get("label"),
+                            nli_score=nli_info.get("score", 0.0),
                         )
                         doc_leaves.append(leaf)
 
-                    # Optional: run NLI/stance on top nli_final_docs
-                    if detect_stance and nli_final_docs > 0:
-                        nli_ids = final_ids[:nli_final_docs]
-                        nli_sents = [self.sentences[int(i)] for i in nli_ids]
-                        try:
-                            groups = _split_by_stance(nli_sents, device=self.device, confidence=stance_confidence)
-                            print(f"\nNLI stance summary on top {len(nli_sents)} docs:")
-                            print(f"  positive={len(groups['positive'])}  negative={len(groups['negative'])}  neutral={len(groups['neutral'])}")
-                        except Exception as e:
-                            print(f"  NLI failed ({e}) — skipping stance summary")
-
                     return doc_leaves
-        # ── No refinement: return top-level clusters (+ stance if requested) ──
+        # ── No refinement: return precomputed layer-2 clusters (+ stance) ──
         if not refine or max_depth == 0:
             leaves = []
-            for lbl, sim in hits:
+            for lbl, sim, group_id in selected_cluster_hits:
                 idx = self.label_to_indices.get(str(lbl), [])
                 topic = self.combined_topics.get(
                     str(lbl), _infer_topic([self.sentences[i] for i in idx])
@@ -904,7 +993,7 @@ class ClusterSearch:
                 leaves.append(self._leaf_from_indices(
                     indices=idx,
                     depth=0,
-                    parent_label=lbl,
+                    parent_label=group_id,
                     sub_label=-1,
                     similarity=sim,
                     run_stance=detect_stance,
@@ -913,24 +1002,19 @@ class ClusterSearch:
                 ))
             return sorted(leaves, key=lambda x: -x.similarity)
 
-        # ── Stage 2: shallow HDBSCAN refinement with early exit ───────────
-        print(
-            f"\nStage 2 — HDBSCAN refinement "
-            f"(max_depth={max_depth}, homogeneity_threshold={HOMOGENEITY_THRESHOLD}) …"
-        )
+        # ── Stage 3: query-time refinement with early exit ────────────────
         all_leaves: list[LeafCluster] = []
 
-        for lbl, sim in hits:
+        for lbl, sim, group_id in selected_cluster_hits:
             idx = self.label_to_indices.get(str(lbl), [])
             if not idx:
                 continue
             topic = self.combined_topics.get(str(lbl), f"cluster {lbl}")
-            print(f"\n  Refining cluster [{lbl}]  '{topic[:50]}'  ({len(idx)} pts)")
 
             leaves = self._recursive_refine(
                 indices          = idx,
                 query_vec        = query_vec,
-                parent_label     = lbl,
+                parent_label     = group_id,
                 parent_sim       = sim,
                 depth            = 0,
                 max_depth        = max_depth,
@@ -953,11 +1037,11 @@ class ClusterSearch:
         if len(all_leaves) > top_k:
             all_leaves = all_leaves[:top_k]
 
-        print(f"\n{'='*60}")
-        print(f"Returned {len(all_leaves)} leaf clusters (top {top_k})")
         bias_count = sum(1 for l in all_leaves if l.has_stance_split)
-        print(f"  of which {bias_count} received a stance split")
-        print(f"{'='*60}\n")
+        metrics = self._compute_search_metrics(all_leaves)
+        print(f"Returned {len(all_leaves)} results (stance split: {bias_count})")
+        if metrics:
+            print(f"  Coverage: {metrics['coverage_pct']:.1f}% | Diversity: {metrics['clusters_represented']} clusters")
         return all_leaves
 
     # ── Display ────────────────────────────────────────────────────────────
@@ -967,38 +1051,38 @@ class ClusterSearch:
         results   : list[LeafCluster],
         max_sents : int = 5,
     ) -> None:
-        """Pretty-print search results, showing stance splits when present."""
+        """Pretty-print search results with quality metrics."""
         if not results:
             print("No results.")
             return
 
+        # Calculate per-result metrics
+        max_sim = max((r.similarity for r in results), default=0)
+        total_results_docs = sum(len(r.sentences) for r in results)
+
         for i, r in enumerate(results, 1):
-            print(f"\n{'─'*60}")
-            print(f"Result {i}  |  depth={r.depth}  sim={r.similarity:.3f}  n={len(r.sentences)}")
-            print(f"Topic   : {r.topic}")
-            print(f"Parent  : cluster {r.parent_label}")
+            # Similarity percentile within this result set
+            sim_pct = 100 * r.similarity / max_sim if max_sim > 0 else 0
+            
+            # Result header with topic, similarity, and quality info
+            print(f"\n{i}. [{r.topic[:50]}]")
+            print(f"   Sim: {r.similarity:.3f} ({sim_pct:.0f}% of top) | Docs: {len(r.sentences)}")
+            
+            # Show NLI stance if available
+            if r.nli_label:
+                label_short = "POS" if "positive" in r.nli_label else "NEG" if "negative" in r.nli_label else "?"
+                print(f"   Stance: {label_short} (conf={r.nli_score:.2f})")
+            
+            # Show sample sentences
+            for s in r.sentences[:max_sents]:
+                print(f"   • {s}")
+            if len(r.sentences) > max_sents:
+                print(f"   … and {len(r.sentences) - max_sents} more")
 
+            # Show bias split if detected
             if r.has_stance_split:
-                # Show both sides of the framing split
-                print(f"\n  ◈ BIAS SPLIT DETECTED")
-                sides = [
-                    ("positive framing", r.stance_sides.get("positive", [])),
-                    ("negative framing", r.stance_sides.get("negative", [])),
-                    ("neutral",          r.stance_sides.get("neutral",  [])),
-                ]
-                for side_name, side_sents in sides:
-                    if not side_sents:
-                        continue
-                    print(f"\n  [{side_name.upper()}]  ({len(side_sents)} headlines)")
-                    for s in side_sents[:max_sents]:
-                        print(f"    • {s}")
-                    if len(side_sents) > max_sents:
-                        print(f"    … and {len(side_sents) - max_sents} more")
-            else:
-                print(f"Samples :")
-                for s in r.sentences[:max_sents]:
-                    print(f"    • {s}")
-                if len(r.sentences) > max_sents:
-                    print(f"    … and {len(r.sentences) - max_sents} more")
-
-        print(f"\n{'─'*60}")
+                print(f"   [BIAS SPLIT]")
+                for side_name in ["positive", "negative", "neutral"]:
+                    side_sents = r.stance_sides.get(side_name, [])
+                    if side_sents:
+                        print(f"     {side_name}: {len(side_sents)} headlines")
