@@ -34,6 +34,10 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import numpy as np
+try:
+    import faiss
+except Exception:
+    faiss = None
 
 warnings.filterwarnings("ignore")
 
@@ -344,6 +348,9 @@ class ClusterSearch:
 
         self._model         = None   # BGE encoder, lazy-loaded
         self._load_store()
+        # FAISS index cache directory
+        self._faiss_dir = os.path.join(self.cache_dir, "faiss_indexes")
+        os.makedirs(self._faiss_dir, exist_ok=True)
 
     # ── Store loading ──────────────────────────────────────────────────────
 
@@ -405,6 +412,115 @@ class ClusterSearch:
             normalize_embeddings=True,
         )[0]
         return vec.astype(np.float32)
+
+    # ── FAISS helpers ─────────────────────────────────────────────────────
+
+    def _faiss_index_path(self, label: int) -> str:
+        return os.path.join(self._faiss_dir, f"{label}.index")
+
+    def _faiss_map_path(self, label: int) -> str:
+        return os.path.join(self._faiss_dir, f"{label}_docids.npy")
+
+    def _build_faiss_index(self, label: int, nlist: int | None = None) -> None:
+        """Build and persist a FAISS IVF index for the documents in `label`.
+
+        This is lazy-built on demand. Uses IndexFlatIP quantizer + IndexIVFFlat
+        with inner-product metric (embeddings are assumed L2-normalised).
+        """
+        if faiss is None:
+            raise ImportError("faiss is required for document-level retrieval. Install faiss.")
+
+        doc_ids = self.label_to_indices.get(str(label), [])
+        if not doc_ids:
+            raise ValueError(f"No documents found for label {label}")
+
+        vecs = self.embeddings[np.array(doc_ids)].astype(np.float32)
+        N, D = vecs.shape
+
+        # Heuristic: choose nlist ~= sqrt(N) but at least 1
+        if nlist is None:
+            nlist = max(1, int(np.sqrt(max(1, N))))
+
+        quantizer = faiss.IndexFlatIP(D)
+        index = faiss.IndexIVFFlat(quantizer, D, nlist, faiss.METRIC_INNER_PRODUCT)
+
+        if not index.is_trained:
+            index.train(vecs)
+        index.add(vecs)
+
+        # Persist index and docid map
+        faiss.write_index(index, self._faiss_index_path(label))
+        np.save(self._faiss_map_path(label), np.array(doc_ids, dtype=np.int64))
+
+    def _load_faiss_index(self, label: int):
+        """Load FAISS index for a label if present on disk; return (index, docids).
+        Returns (None, None) if no index exists.
+        """
+        if faiss is None:
+            return None, None
+        p = self._faiss_index_path(label)
+        m = self._faiss_map_path(label)
+        if not os.path.exists(p) or not os.path.exists(m):
+            return None, None
+        idx = faiss.read_index(p)
+        docids = np.load(m)
+        return idx, docids
+
+    def _ensure_faiss_index(self, label: int) -> tuple:
+        """Ensure FAISS index exists for label; build if missing. Returns (index, docids)."""
+        idx, docids = self._load_faiss_index(label)
+        if idx is not None:
+            return idx, docids
+        # build (may be slow)
+        self._build_faiss_index(label)
+        return self._load_faiss_index(label)
+
+    def _faiss_search_labels(
+        self,
+        query_vec: np.ndarray,
+        labels: list[int],
+        faiss_top_n: int = 200,
+        nprobe: int = 10,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Search FAISS indexes for a set of cluster labels and aggregate results.
+
+        Returns (doc_ids, scores) arrays (both 1-D, aggregated across labels).
+        """
+        all_ids = []
+        all_scores = []
+
+        for lbl in labels:
+            try:
+                idx, docids = self._ensure_faiss_index(lbl)
+            except Exception as e:
+                print(f"  FAISS build/load failed for label {lbl} ({e}), skipping")
+                continue
+            if idx is None:
+                continue
+            # set nprobe for IVF
+            try:
+                idx.nprobe = nprobe
+            except Exception:
+                pass
+            q = query_vec.reshape(1, -1).astype(np.float32)
+            scores, local_ids = idx.search(q, faiss_top_n)
+            scores = scores.ravel()
+            local_ids = local_ids.ravel()
+            # filter out -1 (missing)
+            mask = local_ids >= 0
+            local_ids = local_ids[mask]
+            scores = scores[mask]
+            # map to global doc ids
+            global_ids = docids[local_ids]
+            all_ids.append(global_ids)
+            all_scores.append(scores)
+
+        if not all_ids:
+            return np.array([], dtype=np.int64), np.array([], dtype=np.float32)
+
+        all_ids = np.concatenate(all_ids)
+        all_scores = np.concatenate(all_scores)
+        return all_ids, all_scores
 
     # ── Stage 1: cosine similarity over cluster centroids ─────────────────
 
@@ -658,6 +774,12 @@ class ClusterSearch:
         detect_stance    : bool  = True,
         stance_confidence: float = 0.60,
         top_k_per_level  : int   = 3,   # ← new: keep only top-K sub-clusters at each HDBSCAN level
+        use_faiss        : bool  = True, # use FAISS IVF + rerank for final retrieval
+        final_candidate_docs: int = 5000,
+        faiss_top_n      : int  = 200,
+        exact_rerank_top_n: int = 50,
+        nli_final_docs   : int  = 20,
+        nprobe           : int  = 10,
     ) -> list[LeafCluster]:
         """
         Find semantically relevant clusters and split by news framing.
@@ -701,6 +823,76 @@ class ClusterSearch:
             count = len(self.label_to_indices.get(str(lbl), []))
             print(f"  [{lbl}]  sim={sim:.3f}  n={count:4d}  {topic[:60]}")
 
+        # ── Document-level retrieval via FAISS (coarse routing by centroids) ──
+        if use_faiss:
+            candidate_labels = [int(lbl) for lbl, _ in hits]
+            print(f"\nUsing FAISS IVF within {len(candidate_labels)} candidate clusters …")
+            doc_ids, approx_scores = self._faiss_search_labels(
+                query_vec=query_vec,
+                labels=candidate_labels,
+                faiss_top_n=faiss_top_n,
+                nprobe=nprobe,
+            )
+
+            if doc_ids.size == 0:
+                print("  FAISS returned no candidates — falling back to cluster-level flow")
+            else:
+                # aggregate by doc id (keep best approx score)
+                order = np.argsort(approx_scores)[::-1]
+                doc_ids = doc_ids[order]
+                approx_scores = approx_scores[order]
+
+                # keep up to final_candidate_docs unique docs
+                unique_map = {}
+                uniq_list = []
+                uniq_scores = []
+                for did, sc in zip(doc_ids, approx_scores):
+                    if int(did) in unique_map:
+                        continue
+                    unique_map[int(did)] = True
+                    uniq_list.append(int(did))
+                    uniq_scores.append(float(sc))
+                    if len(uniq_list) >= final_candidate_docs:
+                        break
+
+                if not uniq_list:
+                    print("  No unique candidate docs found — falling back to cluster-level flow")
+                else:
+                    cand_ids = np.array(uniq_list, dtype=np.int64)
+                    cand_embs = self.embeddings[cand_ids]
+                    exact_scores = (cand_embs @ query_vec).astype(np.float32)
+                    top_idx = np.argsort(exact_scores)[::-1][:exact_rerank_top_n]
+                    final_ids = cand_ids[top_idx]
+                    final_scores = exact_scores[top_idx]
+
+                    # Build LeafCluster objects for final docs (one sentence each)
+                    doc_leaves: list[LeafCluster] = []
+                    for did, sc in zip(final_ids.tolist(), final_scores.tolist()):
+                        s = self.sentences[int(did)]
+                        combined_lbl = int(self.combined_labels[int(did)])
+                        topic = self.combined_topics.get(str(combined_lbl), _infer_topic([s]))
+                        leaf = LeafCluster(
+                            depth=0,
+                            topic=topic,
+                            sentences=[s],
+                            similarity=float(sc),
+                            parent_label=combined_lbl,
+                            sub_label=-1,
+                        )
+                        doc_leaves.append(leaf)
+
+                    # Optional: run NLI/stance on top nli_final_docs
+                    if detect_stance and nli_final_docs > 0:
+                        nli_ids = final_ids[:nli_final_docs]
+                        nli_sents = [self.sentences[int(i)] for i in nli_ids]
+                        try:
+                            groups = _split_by_stance(nli_sents, device=self.device, confidence=stance_confidence)
+                            print(f"\nNLI stance summary on top {len(nli_sents)} docs:")
+                            print(f"  positive={len(groups['positive'])}  negative={len(groups['negative'])}  neutral={len(groups['neutral'])}")
+                        except Exception as e:
+                            print(f"  NLI failed ({e}) — skipping stance summary")
+
+                    return doc_leaves
         # ── No refinement: return top-level clusters (+ stance if requested) ──
         if not refine or max_depth == 0:
             leaves = []
