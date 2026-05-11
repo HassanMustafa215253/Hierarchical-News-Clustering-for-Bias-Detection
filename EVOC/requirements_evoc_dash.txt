@@ -1,0 +1,10 @@
+dash
+plotly
+scikit-learn
+umap-learn
+pandas
+numpy
+flask
+sentence-transformers
+transformers
+torch
