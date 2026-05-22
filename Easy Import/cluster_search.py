@@ -198,29 +198,19 @@ def _run_hdbscan(reduced: np.ndarray, group_size: int) -> np.ndarray:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _reduce(embeddings: np.ndarray, target_dims: int = 50) -> np.ndarray:
-    """PCA → UMAP reduction. Returns float32 array."""
+    """PCA-only reduction (UMAP removed). Returns float32 array."""
     from sklearn.decomposition import PCA
-    from umap import UMAP
 
     N = embeddings.shape[0]
     if N < 4:
         return embeddings.astype(np.float32)
 
-    pca_dims = min(150, N - 1, embeddings.shape[1])
-    pca_out  = PCA(n_components=pca_dims).fit_transform(embeddings)
+    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+    norms = np.where(norms < 1e-9, 1.0, norms)
+    embeddings = embeddings / norms
 
-    umap_dims = min(target_dims, pca_out.shape[1], N - 1)
-    n_neigh   = max(2, min(30, N - 1))
-    reduced   = UMAP(
-        n_components=umap_dims,
-        n_neighbors=n_neigh,
-        min_dist=0.0,
-        metric="euclidean",
-        random_state=42,
-        low_memory=True,
-        n_epochs=300,
-    ).fit_transform(pca_out)
-
+    pca_dims = min(target_dims, N - 1, embeddings.shape[1])
+    reduced = PCA(n_components=pca_dims).fit_transform(embeddings)
     return reduced.astype(np.float32)
 
 
@@ -368,7 +358,7 @@ class ClusterSearch:
 
         print(f"Loading cluster store from {self.cache_dir} …")
         npz = np.load(npz_path)
-        self.embeddings      : np.ndarray     = npz["embeddings"]
+        self.embeddings      : np.ndarray     = npz["embeddings"]  # full 1024-D cosine space
         self.group_labels    : np.ndarray     = npz["group_labels"]
         self.sub_labels      : np.ndarray     = npz["sub_labels"]
         self.combined_labels : np.ndarray     = npz["combined_labels"]
@@ -380,6 +370,9 @@ class ClusterSearch:
         self.group_topics    : list[str]      = meta["group_topics"]
         self.combined_topics : dict[str, str] = meta["combined_topics"]
         self.label_to_indices: dict[str, list[int]] = meta["label_to_indices"]
+        self.doc_memberships : list[list[list[float]]] | None = meta.get("doc_memberships")
+        self.membership_top_k: int = int(meta.get("membership_top_k", 1))
+        self.membership_min_similarity: float = float(meta.get("membership_min_similarity", 0.0))
 
         cluster_items = list(meta["cluster_centroids"].items())
         cluster_ids = [int(k) for k, _ in cluster_items]
@@ -506,13 +499,14 @@ class ClusterSearch:
         labels: list[int],
         faiss_top_n: int = 200,
         nprobe: int = 10,
-    ) -> tuple[np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Search FAISS indexes for a set of cluster labels and aggregate results.
 
         Returns (doc_ids, scores) arrays (both 1-D, aggregated across labels).
         """
         all_ids = []
         all_scores = []
+        all_labels = []
 
         for lbl in labels:
             try:
@@ -539,13 +533,19 @@ class ClusterSearch:
             global_ids = docids[local_ids]
             all_ids.append(global_ids)
             all_scores.append(scores)
+            all_labels.append(np.full_like(global_ids, int(lbl), dtype=np.int64))
 
         if not all_ids:
-            return np.array([], dtype=np.int64), np.array([], dtype=np.float32)
+            return (
+                np.array([], dtype=np.int64),
+                np.array([], dtype=np.float32),
+                np.array([], dtype=np.int64),
+            )
 
         all_ids = np.concatenate(all_ids)
         all_scores = np.concatenate(all_scores)
-        return all_ids, all_scores
+        all_labels = np.concatenate(all_labels)
+        return all_ids, all_scores, all_labels
 
     # ── Retrieval over precomputed centroids ───────────────────────────────
 
@@ -582,9 +582,14 @@ class ClusterSearch:
         from collections import Counter
         cluster_votes: Counter[int] = Counter()
         for si in top_sent_idx:
-            cl = int(self.combined_labels[si])
-            if cl != -1:
-                cluster_votes[cl] += float(sent_sims[si])
+            if self.doc_memberships:
+                memberships = self.doc_memberships[int(si)]
+                for lbl, w in memberships:
+                    cluster_votes[int(lbl)] += float(sent_sims[si]) * float(w)
+            else:
+                cl = int(self.combined_labels[si])
+                if cl != -1:
+                    cluster_votes[cl] += float(sent_sims[si])
 
         boosted: dict[int, float] = {}
         for lbl, sim in centroid_hits:
@@ -912,7 +917,7 @@ class ClusterSearch:
         # ── Document-level retrieval via FAISS (coarse routing by centroids) ──
         if use_faiss:
             candidate_labels = [int(lbl) for lbl, _, _ in selected_cluster_hits]
-            doc_ids, approx_scores = self._faiss_search_labels(
+            doc_ids, approx_scores, doc_labels = self._faiss_search_labels(
                 query_vec=query_vec,
                 labels=candidate_labels,
                 faiss_top_n=faiss_top_n,
@@ -929,11 +934,12 @@ class ClusterSearch:
                 unique_map = {}
                 uniq_list = []
                 uniq_scores = []
-                for did, sc in zip(doc_ids, approx_scores):
-                    if int(did) in unique_map:
+                for did, sc, lbl in zip(doc_ids, approx_scores, doc_labels):
+                    did_int = int(did)
+                    if did_int in unique_map:
                         continue
-                    unique_map[int(did)] = True
-                    uniq_list.append(int(did))
+                    unique_map[did_int] = int(lbl)
+                    uniq_list.append(did_int)
                     uniq_scores.append(float(sc))
                     if len(uniq_list) >= final_candidate_docs:
                         break
@@ -963,8 +969,8 @@ class ClusterSearch:
                     for did, sc in zip(final_ids.tolist(), final_scores.tolist()):
                         did_int = int(did)
                         s = self.sentences[did_int]
-                        combined_lbl = int(self.combined_labels[did_int])
-                        topic = self.combined_topics.get(str(combined_lbl), _infer_topic([s]))
+                        chosen_lbl = unique_map.get(did_int, int(self.combined_labels[did_int]))
+                        topic = self.combined_topics.get(str(chosen_lbl), _infer_topic([s]))
                         
                         # Attach NLI result if available
                         nli_info = nli_results.get(did_int, {})
@@ -974,7 +980,7 @@ class ClusterSearch:
                             topic=topic,
                             sentences=[s],
                             similarity=float(sc),
-                            parent_label=combined_lbl,
+                            parent_label=chosen_lbl,
                             sub_label=-1,
                             nli_label=nli_info.get("label"),
                             nli_score=nli_info.get("score", 0.0),
