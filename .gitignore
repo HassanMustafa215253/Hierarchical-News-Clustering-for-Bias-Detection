@@ -4,5 +4,9 @@ venv/
 env/
 ENV/
 
+# Python cache
+__pycache__/
+*.py[cod]
+
 # Server
 server.py

@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>News Bias Search Engine</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+  </head>
+  <body>
+    <main class="page">
+      <section class="hero">
+        <p class="eyebrow">Semantic News Search</p>
+        <h1>Search news titles, then see how the results are framed.</h1>
+        <p class="subtitle">
+          The website only sends your query. Colab runs the embedding search and bias grouping from `Main.ipynb`.
+        </p>
+      </section>
+
+      <section class="search-panel">
+        <label class="backend">
+          Colab backend URL <span>optional if `COLAB_BACKEND_URL` is set locally</span>
+          <input id="backendUrl" placeholder="https://your-colab-tunnel-url">
+        </label>
+
+        <form id="searchForm" class="search-box">
+          <input id="query" required placeholder="Search for a topic, event, country, company...">
+          <button type="submit">Search</button>
+        </form>
+      </section>
+
+      <section id="status" class="status hidden"></section>
+      <section id="overview" class="overview hidden"></section>
+      <section id="groups" class="groups"></section>
+    </main>
+
+    <script src="{{ url_for('static', filename='app.js') }}"></script>
+  </body>
+</html>
